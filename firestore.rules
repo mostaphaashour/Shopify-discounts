@@ -1,0 +1,84 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function admin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.enabled == true;
+    }
+    function paid(uid) {
+      let member = get(/databases/$(database)/documents/members/$(uid)).data;
+      return member.enabled == true && member.paymentVerified == true && member.amount == 10
+        && member.currency == 'USD' && member.plan == 'monthly' && member.expiresAt > request.time;
+    }
+    function active(uid) {
+      return owner(uid) && (admin() || (exists(/databases/$(database)/documents/members/$(uid)) && paid(uid)));
+    }
+    match /admins/{uid} {
+      allow read: if owner(uid);
+      allow write: if false;
+    }
+    match /members/{uid} {
+      allow read: if owner(uid) || admin();
+      allow create, update: if admin()
+        && request.resource.data.keys().hasOnly(['enabled','paymentVerified','amount','currency','plan','expiresAt','approvedBy','updatedAt','email'])
+        && request.resource.data.enabled is bool && request.resource.data.paymentVerified == true
+        && request.resource.data.amount == 10 && request.resource.data.currency == 'USD'
+        && request.resource.data.plan == 'monthly' && request.resource.data.expiresAt is timestamp
+        && request.resource.data.approvedBy is string && request.resource.data.email is string
+        && request.resource.data.updatedAt == request.time
+        && (!request.resource.data.enabled || (
+          exists(/databases/$(database)/documents/members/$(uid))
+          && request.resource.data.expiresAt > request.time
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['enabled','updatedAt'])
+        ) || (
+          getAfter(/databases/$(database)/documents/accessRequests/$(uid)).data.status == 'approved'
+          && getAfter(/databases/$(database)/documents/accessRequests/$(uid)).data.paymentState == 'claimed_paid'
+        ));
+      allow delete: if admin();
+    }
+    match /settings/payment {
+      allow read: if request.auth != null;
+      allow create, update: if admin()
+        && request.resource.data.keys().hasOnly(['phone','localAmount','instructions','updatedAt'])
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 30
+        && request.resource.data.localAmount is string && request.resource.data.localAmount.size() <= 50
+        && request.resource.data.instructions is string && request.resource.data.instructions.size() <= 2000
+        && request.resource.data.updatedAt == request.time;
+    }
+    match /accessRequests/{uid} {
+      function validRequest() {
+        let data = request.resource.data;
+        return data.keys().hasOnly(['uid','email','amount','currency','plan','paymentState','reference','status','createdAt','updatedAt','reviewedBy'])
+          && data.uid == uid && data.email is string && data.email.size() <= 320
+          && data.amount == 10 && data.currency == 'USD' && data.plan == 'monthly'
+          && data.paymentState in ['will_pay','claimed_paid']
+          && data.reference is string && data.reference.size() <= 300
+          && data.status in ['pending','approved','rejected']
+          && data.createdAt is timestamp && data.updatedAt == request.time;
+      }
+      allow read: if owner(uid) || admin();
+      allow create: if owner(uid) && validRequest() && request.resource.data.status == 'pending'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time
+        && !request.resource.data.keys().hasAny(['reviewedBy']);
+      allow update: if validRequest() && (
+        (owner(uid) && request.resource.data.status == 'pending'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['paymentState','reference','status','updatedAt']))
+        || (admin() && request.resource.data.uid == resource.data.uid
+          && request.resource.data.reviewedBy == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','reviewedBy','updatedAt'])
+          && (request.resource.data.status != 'approved' || request.resource.data.paymentState == 'claimed_paid'))
+      );
+      allow delete: if admin();
+    }
+    match /users/{uid}/runs/{runId} {
+      allow read, create, update, delete: if active(uid);
+      match /rows/{rowId} {
+        allow read, create, update, delete: if active(uid);
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
